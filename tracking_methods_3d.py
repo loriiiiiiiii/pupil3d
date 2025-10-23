@@ -223,35 +223,35 @@ def calculate_ellipse_scores(thresholded_images, ellipses):
     
     return percents
 
-def select_best_ellipse(ellipses, percents, prev_ellipse, x, y, frame_idx):
+def select_best_ellipse(ellipses_custom, ellipses_opencv, percents, prev_ellipse_custom, prev_ellipse_opencv, x, y, frame_idx):
     """Select best ellipse with fallback to previous frame if needed"""
     best_idx = int(np.argmax(percents))
-    best_ellipse = ellipses[best_idx]
+    best_ellipse_custom = ellipses_custom[best_idx]
+    best_ellipse_opencv = ellipses_opencv[best_idx]
 
     # Fallback to previous ellipse if current is None
-    if best_ellipse is None:
-        if prev_ellipse is not None:
-            best_ellipse, prev_x, prev_y = prev_ellipse
-            x, y = prev_x, prev_y
+    if best_ellipse_custom is None:
+        if prev_ellipse_custom is not None:
+            return prev_ellipse_custom, prev_ellipse_opencv
         else:
-            return None, x, y
+            return None
 
     # Validate against previous ellipse
-    if prev_ellipse is not None:
-        (pcx, pcy), (pw, ph), pang = prev_ellipse[0]
-        (cx, cy), (w, h), ang = best_ellipse
+    if prev_ellipse_custom is not None:
+        prev_ellipse_data, prev_x, prev_y = prev_ellipse_custom
+        (pcx, pcy), (pw, ph), pang = prev_ellipse_data
+        (cx, cy), (w, h), ang = best_ellipse_custom
         
         # Check for teleporting (sudden large movement)
-        if (w*h) < (pw*ph) and (abs(cy - pcy) > 100 or abs(cx - pcx) > 100):
-            best_ellipse = prev_ellipse[0]
-            x, y = prev_ellipse[1], prev_ellipse[2]
-        elif (w*h) < 0.3 * (pw*ph):
-            best_ellipse = prev_ellipse[0]
+        if (w*h) < (0.8*pw*ph) and (abs(cy - pcy) > 100 or abs(cx - pcx) > 100):
+            print(f"Teleporting {frame_idx} {w*h} {0.9*pw*ph}")
+            return prev_ellipse_custom, prev_ellipse_opencv
 
-    return best_ellipse, x, y
+    return [best_ellipse_custom, x, y], [best_ellipse_opencv, x, y]
 
-def apply_smoothing(best_ellipse, x, y, ema, x_alpha, y_alpha, width_alpha, height_alpha, rotation_alpha):
+def apply_smoothing(ellipse_data, ema, x_alpha, y_alpha, width_alpha, height_alpha, rotation_alpha):
     """Apply exponential moving average smoothing to ellipse parameters"""
+    best_ellipse, x, y = ellipse_data
     best_ellipse = check_flip(best_ellipse)
     (cx, cy), (w, h), ang = best_ellipse
 
@@ -285,7 +285,7 @@ def draw_orthogonal_ray(image, ellipse, length=100, color=(0, 255, 0), thickness
     return image
 
 def display_results(frame, thresholded_images, contour_images, ellipse_images, 
-                    full_ellipse_custom, ellipse_opencv, cx, cy, x, y, frame_idx, thresholds, best_idx):
+                    full_ellipse_custom, ellipse_opencv, raw_ellipse, cx, cy, frame_idx, thresholds, best_idx):
     """Display processing steps and results"""
     N = len(thresholded_images)
     H, W = thresholded_images[0].shape
@@ -325,18 +325,24 @@ def display_results(frame, thresholded_images, contour_images, ellipse_images,
     cv2.putText(frame, f"Min:{min(cw, ch):.1f}", (int(ccx) + 10, int(ccy) + 5), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
     
+    if raw_ellipse is not None:
+        raw_ellipse_data, x, y = raw_ellipse
+        (rx, ry), (rw, rh), rang = raw_ellipse_data
+        raw_ellipse = ((rx + x, ry + y), (rw, rh), rang)
+        cv2.ellipse(frame, raw_ellipse, (255, 255, 0), 1)
+
     # Draw OpenCV ellipse (cyan)
     if ellipse_opencv is not None:
-        (ocx, ocy), (ow, oh), oang = ellipse_opencv
+        ellipse_opencv_data, x, y = ellipse_opencv
+        (ocx, ocy), (ow, oh), oang = ellipse_opencv_data
         opencv_full = ((ocx + x, ocy + y), (ow, oh), oang)
-        cv2.ellipse(frame, opencv_full, (255, 255, 0), 1)
-        cv2.circle(frame, (int(ocx + x), int(ocy + y)), 2, (255, 0, 255), -1)
-        draw_orthogonal_ray(frame, opencv_full, length=150, color=(255, 255, 0), thickness=1)
+        cv2.ellipse(frame, opencv_full, (255, 0, 255), 1)
+        draw_orthogonal_ray(frame, opencv_full, length=100, color=(255, 0, 255), thickness=1)
         
         cv2.putText(frame, f"Ang:{oang:.1f}", (int(ocx + x) - 60, int(ocy + y) - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
         cv2.putText(frame, f"Min:{min(ow, oh):.1f}", (int(ocx + x) - 60, int(ocy + y) + 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
     
     cv2.putText(frame, f"Frame: {frame_idx} | Green=Custom | Cyan=OpenCV", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -369,7 +375,8 @@ def main():
     # Threshold values to try
     thresholds = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48]
     
-    prev_ellipse = None
+    prev_ellipse_custom = None
+    prev_ellipse_opencv = None
     ema = None
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
@@ -406,32 +413,33 @@ def main():
         # Score ellipses based on OpenCV fits
         percents = calculate_ellipse_scores(thresholded_images, ellipses_opencv)
         
-        # Select best ellipse
+        # Select best ellipse (returns [ellipse, x, y])
         current_x, current_y = x, y
-        best_ellipse_custom, ellipse_x, ellipse_y = select_best_ellipse(
-            ellipses_custom, percents, prev_ellipse, x, y, frame_idx)
+        best_ellipse_custom, best_ellipse_opencv = select_best_ellipse(ellipses_custom, ellipses_opencv, percents, prev_ellipse_custom, prev_ellipse_opencv, x, y, frame_idx)
         
         if best_ellipse_custom is None:
             frame_idx += 1
             continue
         
-        # Get corresponding OpenCV ellipse
-        best_idx = int(np.argmax(percents))
-        best_ellipse_opencv = ellipses_opencv[best_idx]
-        
-        prev_ellipse = (best_ellipse_custom, ellipse_x, ellipse_y)
+        prev_ellipse_custom = best_ellipse_custom
+        prev_ellipse_opencv = best_ellipse_opencv
 
-        # Apply smoothing
+        # Get corresponding OpenCV ellipse and bundle with crop coordinates
+        best_idx = int(np.argmax(percents))
+        raw_ellipse = ellipses_opencv[best_idx]
+        raw_ellipse = [raw_ellipse, x, y] if raw_ellipse is not None else None
+        
+        # Apply smoothing (pass bundled data)
         full_ellipse_custom, ema = apply_smoothing(
-            best_ellipse_custom, ellipse_x, ellipse_y, ema,
+            best_ellipse_custom, ema,
             x_alpha, y_alpha, width_alpha, height_alpha, rotation_alpha)
         
         (cx, cy), (w, h), ang = full_ellipse_custom
 
-        # Display results
+        # Display results (pass bundled data)
         display_results(frame, thresholded_images, contour_images, ellipse_images, 
-                       full_ellipse_custom, best_ellipse_opencv, cx, cy, 
-                       current_x, current_y, frame_idx, thresholds, best_idx)
+                       full_ellipse_custom, best_ellipse_opencv, raw_ellipse, cx, cy, 
+                       frame_idx, thresholds, best_idx)
         frame_idx += 1
         
         # Handle keyboard input
