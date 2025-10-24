@@ -1,8 +1,24 @@
 import cv2
 import numpy as np
 import time
+import random
 import tkinter as tk
 from tkinter import filedialog
+
+try:
+    from EyeTracker import gl_sphere
+    GL_SPHERE_AVAILABLE = True
+except ImportError:
+    GL_SPHERE_AVAILABLE = False
+    print("gl_sphere module not found. OpenGL rendering will be disabled.")
+
+
+# Global variables for sphere center tracking
+ray_lines = []
+model_centers = []
+max_rays = 100
+prev_model_center_avg = (320, 240)
+max_observed_distance = 150
 
 def coarse_find(frame, min_size=(150, 150)):
     """Detect eye region using Haar cascade"""
@@ -284,8 +300,111 @@ def draw_orthogonal_ray(image, ellipse, length=100, color=(0, 255, 0), thickness
     cv2.line(image, pt1, pt2, color, thickness)
     return image
 
+def find_line_intersection(ellipse1, ellipse2):
+    """
+    Compute intersection of two lines orthogonal to ellipse surfaces
+    
+    Parameters:
+    - ellipse1, ellipse2: Ellipse tuples ((cx, cy), (major_axis, minor_axis), angle)
+    
+    Returns:
+    - (x, y): Intersection point, or None if parallel
+    """
+    (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
+    (cx2, cy2), (_, minor_axis2), angle2 = ellipse2
+
+    angle1_rad = np.deg2rad(angle1)
+    angle2_rad = np.deg2rad(angle2)
+
+    # Direction vectors for the two lines
+    dx1, dy1 = (minor_axis1 / 2) * np.cos(angle1_rad), (minor_axis1 / 2) * np.sin(angle1_rad)
+    dx2, dy2 = (minor_axis2 / 2) * np.cos(angle2_rad), (minor_axis2 / 2) * np.sin(angle2_rad)
+
+    # Line equations: (cx1, cy1) + t1 * (dx1, dy1) = (cx2, cy2) + t2 * (dx2, dy2)
+    A = np.array([[dx1, -dx2], [dy1, -dy2]])
+    B = np.array([cx2 - cx1, cy2 - cy1])
+
+    if np.linalg.det(A) == 0:
+        return None  # Lines are parallel
+
+    t1, t2 = np.linalg.solve(A, B)
+
+    intersection_x = cx1 + t1 * dx1
+    intersection_y = cy1 + t1 * dy1
+
+    return (int(intersection_x), int(intersection_y))
+
+def compute_average_intersection(frame, ray_lines, N, M, spacing):
+    """
+    Select N random rays, compute their intersections, and return average
+    
+    Parameters:
+    - frame: OpenCV frame to draw on
+    - ray_lines: List of ellipse tuples
+    - N: Number of random lines to select
+    - M: Maximum stored intersections (unused, kept for compatibility)
+    - spacing: Minimum angle difference between rays (unused, kept for compatibility)
+    
+    Returns:
+    - (avg_x, avg_y): Average intersection point
+    """
+    if len(ray_lines) < 2 or N < 2:
+        return None
+
+    height, width = frame.shape[:2]
+    selected_lines = random.sample(ray_lines, min(N, len(ray_lines)))
+    intersections = []
+
+    # Compute intersections for consecutive pairs
+    for i in range(len(selected_lines) - 1):
+        line1 = selected_lines[i]
+        line2 = selected_lines[i + 1]
+
+        angle1 = line1[2]
+        angle2 = line2[2]
+
+        if abs(angle1 - angle2) >= 2:  # Ensure at least 2 degree difference
+            intersection = find_line_intersection(line1, line2)
+            
+            if intersection and (0 <= intersection[0] < width) and (0 <= intersection[1] < height):
+                intersections.append(intersection)
+
+    if not intersections:
+        return None
+
+    avg_x = np.mean([pt[0] for pt in intersections])
+    avg_y = np.mean([pt[1] for pt in intersections])
+
+    return (int(avg_x), int(avg_y))
+
+def update_and_average_point(point_list, new_point, N):
+    """
+    Maintain a list of N most recent points and return their average
+    
+    Parameters:
+    - point_list: List of (x, y) tuples
+    - new_point: New (x, y) point to add
+    - N: Maximum number of points to keep
+    
+    Returns:
+    - (avg_x, avg_y): Average of all points in list
+    """
+    point_list.append(new_point)
+
+    if len(point_list) > N:
+        point_list.pop(0)
+
+    if not point_list:
+        return None
+
+    avg_x = int(np.mean([p[0] for p in point_list]))
+    avg_y = int(np.mean([p[1] for p in point_list]))
+
+    return (avg_x, avg_y)
+
 def display_results(frame, thresholded_images, contour_images, ellipse_images, 
-                    full_ellipse_custom, ellipse_opencv, raw_ellipse, cx, cy, frame_idx, thresholds, best_idx):
+                    full_ellipse_custom, ellipse_opencv, raw_ellipse, cx, cy, 
+                    model_center_average, frame_idx, thresholds, best_idx):
     """Display processing steps and results"""
     N = len(thresholded_images)
     H, W = thresholded_images[0].shape
@@ -344,6 +463,23 @@ def display_results(frame, thresholded_images, contour_images, ellipse_images,
         cv2.putText(frame, f"Min:{min(ow, oh):.1f}", (int(ocx + x) - 60, int(ocy + y) + 5), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
     
+    # Draw sphere center and radius
+    if model_center_average is not None:
+        cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)  # Blue circle
+        cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Yellow center dot
+        
+        # Draw line from sphere center to pupil center
+        if cx is not None and cy is not None:
+            cv2.line(frame, model_center_average, (int(cx), int(cy)), (255, 150, 50), 2)
+            
+            # Update 3D sphere visualization
+            if GL_SPHERE_AVAILABLE:
+                gl_sphere.update_sphere_rotation(
+                    int(cx), int(cy), 
+                    model_center_average[0], model_center_average[1],
+                    screen_width=frame.shape[1], screen_height=frame.shape[0]
+                )
+    
     cv2.putText(frame, f"Frame: {frame_idx} | Green=Custom | Cyan=OpenCV", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.imshow("Eye Tracking", frame)
@@ -363,6 +499,12 @@ def select_video_file():
     return filename
 
 def main():
+    global ray_lines, model_centers, prev_model_center_avg, max_observed_distance
+    
+    if GL_SPHERE_AVAILABLE:
+        # Start GL sphere window once
+        app = gl_sphere.start_gl_window() 
+
     video_path = select_video_file()
     
     # Smoothing parameters
@@ -389,7 +531,9 @@ def main():
             break
         
         # Use top half of frame
-        frame = frame[:frame.shape[0] // 2, :]
+        # frame = frame[:frame.shape[0] // 2, :]
+        # bottom half
+        frame = frame[frame.shape[0]//2:, :]
 
         # Detect eye region every 5 frames
         if frame_idx % 5 == 0:
@@ -436,10 +580,37 @@ def main():
         
         (cx, cy), (w, h), ang = full_ellipse_custom
 
+        # Compute sphere center from ray intersections
+        if best_ellipse_opencv is not None:
+            ellipse_opencv_data, ex, ey = best_ellipse_opencv
+            # Convert to full frame coordinates for ray storage
+            (ocx, ocy), (ow, oh), oang = ellipse_opencv_data
+            full_ellipse_opencv = ((ocx + ex, ocy + ey), (ow, oh), oang)
+            
+            # Store ray for sphere center calculation
+            ray_lines.append(full_ellipse_opencv)
+            
+            # Prune rays if exceeding max
+            if len(ray_lines) > max_rays:
+                ray_lines = ray_lines[-max_rays:]
+        
+        # Compute sphere center
+        model_center_average = (320, 240)
+        model_center = compute_average_intersection(frame, ray_lines, 5, 1500, 5)  # Increased from 5 to 10 rays
+        
+        if model_center is not None:
+            model_center_average = update_and_average_point(model_centers, model_center, 500)  # Increased from 200 to 500
+        
+        # Fallback to previous center if still at default
+        if model_center_average[0] == 320:
+            model_center_average = prev_model_center_avg
+        if model_center_average[0] != 0:
+            prev_model_center_avg = model_center_average
+        
         # Display results (pass bundled data)
         display_results(frame, thresholded_images, contour_images, ellipse_images, 
                        full_ellipse_custom, best_ellipse_opencv, raw_ellipse, cx, cy, 
-                       frame_idx, thresholds, best_idx)
+                       model_center_average, frame_idx, thresholds, best_idx)
         frame_idx += 1
         
         # Handle keyboard input
