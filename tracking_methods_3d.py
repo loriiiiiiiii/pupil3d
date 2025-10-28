@@ -13,14 +13,17 @@ except ImportError:
     print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
 
-class EyeTracker:
-    def __init__(self):
+class PupilDetector:
+    def __init__(self, window_name=""):
+        # Window identifier for display
+        self.window_name = window_name
+        
         # Sphere center tracking state
         self.ray_lines = []
         self.model_centers = []
         self.max_rays = 100
         self.prev_model_center_avg = (320, 240)
-        self.max_observed_distance = 150
+        self.max_observed_distance = 100  # Initial estimate, will be updated from 3D triangulation
         
         # Smoothing state
         self.prev_ellipse_custom = None
@@ -41,7 +44,7 @@ class EyeTracker:
         self.prev_eyes = None
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
     
-    def coarse_find(self, frame, min_size=(100, 100)):
+    def coarse_find(self, frame, min_size=(150, 150)):
         """Detect eye region using Haar cascade"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         eyes = self.eye_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=min_size)
@@ -309,20 +312,6 @@ class EyeTracker:
 
         return full_ellipse
     
-    def draw_orthogonal_ray(self, image, ellipse, length=100, color=(0, 255, 0), thickness=1):
-        """Draw ray perpendicular to ellipse surface"""
-        (cx, cy), (major_axis, minor_axis), angle = ellipse
-        
-        angle_rad = np.deg2rad(angle)
-        normal_dx = (minor_axis / 2) * np.cos(angle_rad)
-        normal_dy = (minor_axis / 2) * np.sin(angle_rad)
-
-        pt1 = (int(cx - length * normal_dx / (minor_axis / 2)), int(cy - length * normal_dy / (minor_axis / 2)))
-        pt2 = (int(cx + length * normal_dx / (minor_axis / 2)), int(cy + length * normal_dy / (minor_axis / 2)))
-
-        cv2.line(image, pt1, pt2, color, thickness)
-        return image
-    
     def find_line_intersection(self, ellipse1, ellipse2):
         """Compute intersection of two lines orthogonal to ellipse surfaces"""
         (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
@@ -395,6 +384,39 @@ class EyeTracker:
 
         return (avg_x, avg_y)
     
+    def display_threshold_grid(self, thresholded_images, contour_images, ellipse_images, best_idx, frame_idx):
+        """Display threshold processing grid"""
+        N = len(thresholded_images)
+        H, W = thresholded_images[0].shape
+        grid = np.zeros((3 * H, N * W), dtype=np.uint8)
+        
+        # Create grid: threshold, contour, ellipse rows
+        for i in range(N):
+            grid[0:H, i*W:(i+1)*W] = thresholded_images[i]
+            grid[H:2*H, i*W:(i+1)*W] = contour_images[i]
+            # Convert ellipse images to grayscale if needed
+            if len(ellipse_images[i].shape) == 3:
+                grid[2*H:3*H, i*W:(i+1)*W] = cv2.cvtColor(ellipse_images[i], cv2.COLOR_BGR2GRAY)
+            else:
+                grid[2*H:3*H, i*W:(i+1)*W] = ellipse_images[i]
+        
+        grid_disp = cv2.resize(grid, (1400, 400))
+        
+        # Label thresholds and highlight selected
+        col_width = 1400 // N
+        for i in range(N):
+            label = f"+{self.thresholds[i]}"
+            color = 255 if i == best_idx else 128
+            cv2.putText(grid_disp, label, (i * col_width + 5, 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2 if i == best_idx else 1)
+            
+            if i == best_idx:
+                x_start = i * col_width
+                x_end = (i + 1) * col_width
+                cv2.rectangle(grid_disp, (x_start, 0), (x_end - 1, 600), 200, 2)
+        
+        cv2.imshow(f"Threshold | Contour | Ellipse {self.window_name}", grid_disp)
+    
     def track_frame(self, frame, frame_idx):
         """Process a single frame and return tracking results"""
         # Detect eye region every 5 frames
@@ -426,6 +448,7 @@ class EyeTracker:
         result = self.select_best_ellipse(ellipses_custom, ellipses_opencv, percents, x, y, frame_idx)
         
         if result is None:
+            print("No ellipse found")
             return None
         
         best_ellipse_custom, best_ellipse_opencv = result
@@ -470,10 +493,10 @@ class EyeTracker:
         if model_center_average[0] != 0:
             self.prev_model_center_avg = model_center_average
         
+        # Display threshold grid inside the class
+        self.display_threshold_grid(thresholded_images, contour_images, ellipse_images, best_idx, frame_idx)
+        
         return {
-            'thresholded_images': thresholded_images,
-            'contour_images': contour_images,
-            'ellipse_images': ellipse_images,
             'full_ellipse_custom': full_ellipse_custom,
             'best_ellipse_opencv': best_ellipse_opencv,
             'raw_ellipse': raw_ellipse,
@@ -486,96 +509,136 @@ class EyeTracker:
         }
 
 
-def display_results(frame, result, frame_idx, thresholds, sphere_radius=150, window_prefix=""):
-    """Display processing steps and results"""
-    if result is None:
-        return
+def draw_orthogonal_ray(image, ellipse, length=100, color=(0, 255, 0), thickness=1):
+    """Draw ray perpendicular to ellipse surface"""
+    (cx, cy), (major_axis, minor_axis), angle = ellipse
     
-    thresholded_images = result['thresholded_images']
-    contour_images = result['contour_images']
-    ellipse_images = result['ellipse_images']
-    full_ellipse_custom = result['full_ellipse_custom']
-    best_ellipse_opencv = result['best_ellipse_opencv']
-    raw_ellipse = result['raw_ellipse']
-    cx = result['cx']
-    cy = result['cy']
-    model_center_average = result['model_center_average']
-    best_idx = result['best_idx']
-    x = result['x']
-    y = result['y']
-    
-    N = len(thresholded_images)
-    H, W = thresholded_images[0].shape
-    grid = np.zeros((3 * H, N * W), dtype=np.uint8)
-    
-    # Create grid: threshold, contour, ellipse rows
-    for i in range(N):
-        grid[0:H, i*W:(i+1)*W] = thresholded_images[i]
-        grid[H:2*H, i*W:(i+1)*W] = contour_images[i]
-        grid[2*H:3*H, i*W:(i+1)*W] = ellipse_images[i]
-    
-    grid_disp = cv2.resize(grid, (1400, 600))
-    
-    # Label thresholds and highlight selected
-    col_width = 1400 // N
-    for i in range(N):
-        label = f"+{thresholds[i]}"
-        color = 255 if i == best_idx else 128
-        cv2.putText(grid_disp, label, (i * col_width + 5, 15), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2 if i == best_idx else 1)
-        
-        if i == best_idx:
-            x_start = i * col_width
-            x_end = (i + 1) * col_width
-            cv2.rectangle(grid_disp, (x_start, 0), (x_end - 1, 600), 200, 2)
-    
-    cv2.imshow(f"Threshold | Contour | Ellipse {window_prefix}", grid_disp)
-    
-    # Draw custom ellipse (green)
-    cv2.ellipse(frame, full_ellipse_custom, (0, 255, 0), 1)
-    cv2.circle(frame, (int(cx), int(cy)), 3, (0, 0, 255), -1)
-    
-    # Display custom ellipse parameters
-    (ccx, ccy), (cw, ch), cang = full_ellipse_custom
-    cv2.putText(frame, f"Ang:{cang:.1f}", (int(ccx) + 10, int(ccy) - 10), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-    cv2.putText(frame, f"Min:{min(cw, ch):.1f}", (int(ccx) + 10, int(ccy) + 5), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-    
-    if raw_ellipse is not None:
-        raw_ellipse_data, rx, ry = raw_ellipse
-        (ocx, ocy), (ow, oh), oang = raw_ellipse_data
-        raw_ellipse_full = ((ocx + rx, ocy + ry), (ow, oh), oang)
-        cv2.ellipse(frame, raw_ellipse_full, (255, 255, 0), 1)
+    angle_rad = np.deg2rad(angle)
+    normal_dx = (minor_axis / 2) * np.cos(angle_rad)
+    normal_dy = (minor_axis / 2) * np.sin(angle_rad)
 
-    # Draw OpenCV ellipse (magenta)
-    if best_ellipse_opencv is not None:
-        ellipse_opencv_data, ex, ey = best_ellipse_opencv
-        (ocx, ocy), (ow, oh), oang = ellipse_opencv_data
-        opencv_full = ((ocx + ex, ocy + ey), (ow, oh), oang)
-        cv2.ellipse(frame, opencv_full, (255, 0, 255), 1)
-        
-        cv2.putText(frame, f"Ang:{oang:.1f}", (int(ocx + ex) - 60, int(ocy + ey) - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-        cv2.putText(frame, f"Min:{min(ow, oh):.1f}", (int(ocx + ex) - 60, int(ocy + ey) + 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-    
-    # Draw sphere center and radius
-    if model_center_average is not None:
-        cv2.circle(frame, model_center_average, sphere_radius, (255, 50, 50), 2)
-        cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
-        
-        if cx is not None and cy is not None:
-            cv2.line(frame, model_center_average, (int(cx), int(cy)), (255, 150, 50), 2)
-    
-    cv2.putText(frame, f"Frame: {frame_idx} | Green=Custom | Cyan=OpenCV", (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.imshow(f"Eye Tracking {window_prefix}", frame)
+    pt1 = (int(cx - length * normal_dx / (minor_axis / 2)), int(cy - length * normal_dy / (minor_axis / 2)))
+    pt2 = (int(cx + length * normal_dx / (minor_axis / 2)), int(cy + length * normal_dy / (minor_axis / 2)))
+
+    cv2.line(image, pt1, pt2, color, thickness)
 
 
-def display_results_bottom(frame, result, frame_idx, thresholds, sphere_radius=150):
-    """Display results for bottom stream with different window names"""
-    display_results(frame, result, frame_idx, thresholds, sphere_radius=sphere_radius, window_prefix="(Bottom)")
+def display_results(frame, result_top, result_bottom, frame_idx, sphere_radius_top=150, sphere_radius_bottom=150, pupil_3d=None):
+    """Display eye tracking results for both stereo views on the full frame"""
+    height = frame.shape[0]
+    half_height = height // 2
+    
+    # Draw top result
+    if result_top is not None:
+        full_ellipse_custom = result_top['full_ellipse_custom']
+        best_ellipse_opencv = result_top['best_ellipse_opencv']
+        raw_ellipse = result_top['raw_ellipse']
+        cx = result_top['cx']
+        cy = result_top['cy']
+        model_center_average = result_top['model_center_average']
+        
+        # Draw custom ellipse (green)
+        cv2.ellipse(frame, full_ellipse_custom, (0, 255, 0), 1)
+        cv2.circle(frame, (int(cx), int(cy)), 3, (0, 0, 255), -1)
+        
+        # Display custom ellipse parameters
+        (ccx, ccy), (cw, ch), cang = full_ellipse_custom
+        cv2.putText(frame, f"Ang:{cang:.1f}", (int(ccx) + 10, int(ccy) - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.putText(frame, f"Min:{min(cw, ch):.1f}", (int(ccx) + 10, int(ccy) + 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        if raw_ellipse is not None:
+            raw_ellipse_data, rx, ry = raw_ellipse
+            (rcx, rcy), (rw, rh), rang = raw_ellipse_data
+            raw_full = ((rcx + rx, rcy + ry), (rw, rh), rang)
+            cv2.ellipse(frame, raw_full, (255, 255, 0), 1)
+        
+        # Draw OpenCV ellipse (magenta)
+        if best_ellipse_opencv is not None:
+            ellipse_opencv_data, ex, ey = best_ellipse_opencv
+            (ocx, ocy), (ow, oh), oang = ellipse_opencv_data
+            opencv_full = ((ocx + ex, ocy + ey), (ow, oh), oang)
+            cv2.ellipse(frame, opencv_full, (255, 0, 255), 1)
+            
+            # Draw orthogonal ray
+            draw_orthogonal_ray(frame, opencv_full, length=50, color=(255, 0, 255), thickness=1)
+            
+            cv2.putText(frame, f"Ang:{oang:.1f}", (int(ocx + ex) - 60, int(ocy + ey) - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            cv2.putText(frame, f"Min:{min(ow, oh):.1f}", (int(ocx + ex) - 60, int(ocy + ey) + 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+        
+        # Draw sphere center and radius
+        if model_center_average is not None:
+            cv2.circle(frame, model_center_average, sphere_radius_top, (255, 50, 50), 2)
+            cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
+            
+            if cx is not None and cy is not None:
+                cv2.line(frame, model_center_average, (int(cx), int(cy)), (255, 150, 50), 2)
+    
+    # Draw bottom result (offset by half_height)
+    if result_bottom is not None:
+        full_ellipse_custom = result_bottom['full_ellipse_custom']
+        best_ellipse_opencv = result_bottom['best_ellipse_opencv']
+        raw_ellipse = result_bottom['raw_ellipse']
+        cx = result_bottom['cx']
+        cy = result_bottom['cy']
+        model_center_average = result_bottom['model_center_average']
+        
+        # Offset all coordinates by half_height
+        (ccx, ccy), (cw, ch), cang = full_ellipse_custom
+        full_ellipse_custom_offset = ((ccx, ccy + half_height), (cw, ch), cang)
+        
+        # Draw custom ellipse (green)
+        cv2.ellipse(frame, full_ellipse_custom_offset, (0, 255, 0), 1)
+        cv2.circle(frame, (int(cx), int(cy + half_height)), 3, (0, 0, 255), -1)
+        
+        # Display custom ellipse parameters
+        cv2.putText(frame, f"Ang:{cang:.1f}", (int(ccx) + 10, int(ccy + half_height) - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.putText(frame, f"Min:{min(cw, ch):.1f}", (int(ccx) + 10, int(ccy + half_height) + 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        if raw_ellipse is not None:
+            raw_ellipse_data, rx, ry = raw_ellipse
+            (rcx, rcy), (rw, rh), rang = raw_ellipse_data
+            raw_full = ((rcx + rx, rcy + ry + half_height), (rw, rh), rang)
+            cv2.ellipse(frame, raw_full, (255, 255, 0), 1)
+        
+        # Draw OpenCV ellipse (magenta)
+        if best_ellipse_opencv is not None:
+            ellipse_opencv_data, ex, ey = best_ellipse_opencv
+            (ocx, ocy), (ow, oh), oang = ellipse_opencv_data
+            opencv_full = ((ocx + ex, ocy + ey + half_height), (ow, oh), oang)
+            cv2.ellipse(frame, opencv_full, (255, 0, 255), 1)
+            
+            # Draw orthogonal ray
+            draw_orthogonal_ray(frame, opencv_full, length=50, color=(255, 0, 255), thickness=1)
+            
+            cv2.putText(frame, f"Ang:{oang:.1f}", (int(ocx + ex) - 60, int(ocy + ey + half_height) - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            cv2.putText(frame, f"Min:{min(ow, oh):.1f}", (int(ocx + ex) - 60, int(ocy + ey + half_height) + 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+        
+        # Draw sphere center and radius (offset)
+        if model_center_average is not None:
+            model_center_offset = (model_center_average[0], model_center_average[1] + half_height)
+            cv2.circle(frame, model_center_offset, sphere_radius_bottom, (255, 50, 50), 2)
+            cv2.circle(frame, model_center_offset, 8, (255, 255, 0), -1)
+            
+            if cx is not None and cy is not None:
+                cv2.line(frame, model_center_offset, (int(cx), int(cy + half_height)), (255, 150, 50), 2)
+    
+    # Display 3D position if available
+    if pupil_3d is not None:
+        x_mm, y_mm, z_mm = pupil_3d
+        cv2.putText(frame, f"Frame: {frame_idx} | 3D: ({x_mm:.1f}, {y_mm:.1f}, {z_mm:.1f}) mm", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    else:
+        cv2.putText(frame, f"Frame: {frame_idx}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.imshow("Eye Tracking", frame)
 
 
 def select_video_file():
@@ -714,9 +777,9 @@ def main():
     CONVERGENCE_ANGLE = 36  # Angle from forward direction (90° - 54° from horizontal)
     IMAGE_WIDTH = 648
     
-    # Create two tracker instances for stereo
-    tracker_top = EyeTracker()
-    tracker_bottom = EyeTracker()
+    # Create two pupil detector instances for stereo
+    tracker_top = PupilDetector(window_name="(Top)")
+    tracker_bottom = PupilDetector(window_name="(Bottom)")
     
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
@@ -763,46 +826,71 @@ def main():
                 
                 # Only use valid depth (positive Z, reasonable range)
                 if z_mm > 5.0 and z_mm < 100.0:
-                    print(f"Frame {frame_idx}: Pupil 3D = ({x_mm:6.2f}, {y_mm:6.2f}, {z_mm-2.18:6.2f}) mm")
                     
-                    # Calculate sphere radius in pixels based on depth
-                    # Eye radius = 12mm in real world
-                    # Convert to pixels using perspective projection
-                    EYE_RADIUS_MM = 13.0
+                    # Calculate sphere radius in pixels for each camera view
+                    # The sphere center is at the eyeball center, pupil is on the surface
+                    # We need to calculate the 2D pixel distance from sphere center to pupil
+                    
+                    EYE_RADIUS_MM = 13.0  # Real-world eye radius
                     half_fov_rad = np.deg2rad(FOV_DEGREES / 2)
+                    convergence_rad = np.deg2rad(CONVERGENCE_ANGLE)
                     
-                    # At depth z_mm, calculate how many pixels per mm
-                    # tan(half_fov) = (image_width/2) / focal_length_effective
-                    # At depth z, physical_width = z * tan(half_fov) * 2
-                    # pixels_per_mm = image_width / physical_width
-                    physical_width_at_depth = z_mm * np.tan(half_fov_rad) * 2
-                    pixels_per_mm = IMAGE_WIDTH / physical_width_at_depth
-                    sphere_radius_px = int(EYE_RADIUS_MM * pixels_per_mm)
+                    # For each camera, calculate the distance from camera to the 3D pupil position
+                    # Left camera is at (-baseline/2, 0, 0), right camera at (+baseline/2, 0, 0)
+                    # Both cameras point inward at convergence_angle
+                    
+                    # Calculate distance from each camera to the pupil
+                    if TOP_IS_LEFT:
+                        # Top camera is left: at (-baseline/2, 0, 0)
+                        camera_left_x = -BASELINE_MM / 2
+                        camera_right_x = BASELINE_MM / 2
+                    else:
+                        # Top camera is right: at (+baseline/2, 0, 0)
+                        camera_left_x = BASELINE_MM / 2
+                        camera_right_x = -BASELINE_MM / 2
+                    
+                    # Distance from left camera to pupil (in camera's rotated coordinate system)
+                    # Transform pupil position to left camera's coordinate system
+                    pupil_rel_left_x = x_mm - camera_left_x
+                    pupil_rel_left_z = z_mm
+                    # Rotate by convergence angle to get distance along camera's optical axis
+                    dist_left_z = pupil_rel_left_x * np.sin(convergence_rad) + pupil_rel_left_z * np.cos(convergence_rad)
+                    
+                    # Distance from right camera to pupil
+                    pupil_rel_right_x = x_mm - camera_right_x
+                    pupil_rel_right_z = z_mm
+                    dist_right_z = -pupil_rel_right_x * np.sin(convergence_rad) + pupil_rel_right_z * np.cos(convergence_rad)
+                    
+                    # Calculate pixels per mm at each camera's viewing distance
+                    physical_width_left = dist_left_z * np.tan(half_fov_rad) * 2
+                    pixels_per_mm_left = IMAGE_WIDTH / physical_width_left
+                    sphere_radius_left = int(EYE_RADIUS_MM * pixels_per_mm_left)
+                    
+                    physical_width_right = dist_right_z * np.tan(half_fov_rad) * 2
+                    pixels_per_mm_right = IMAGE_WIDTH / physical_width_right
+                    sphere_radius_right = int(EYE_RADIUS_MM * pixels_per_mm_right)
                     
                     # Clamp to reasonable range
-                    sphere_radius_px = max(20, min(sphere_radius_px, 300))
+                    sphere_radius_left = max(20, min(sphere_radius_left, 300))
+                    sphere_radius_right = max(20, min(sphere_radius_right, 300))
                     
-                    # Update both trackers' sphere radius
-                    tracker_top.max_observed_distance = sphere_radius_px
-                    tracker_bottom.max_observed_distance = sphere_radius_px
+                    # Update each tracker with its own sphere radius
+                    if TOP_IS_LEFT:
+                        tracker_top.max_observed_distance = sphere_radius_left
+                        tracker_bottom.max_observed_distance = sphere_radius_right
+                    else:
+                        tracker_top.max_observed_distance = sphere_radius_right
+                        tracker_bottom.max_observed_distance = sphere_radius_left
                     
-                    # print(f"  Depth: {z_mm:.2f}mm -> Sphere radius: {sphere_radius_px}px")
+                    # print(f"  Sphere radius: Left={sphere_radius_left}px, Right={sphere_radius_right}px")
                 else:
                     print(f"Frame {frame_idx}: Invalid depth {z_mm:.2f}mm (skipping)")
         
-        # Display results for top stream
-        if result_top is not None:
-            display_results(frame_top, result_top, frame_idx, tracker_top.thresholds, 
-                          sphere_radius=tracker_top.max_observed_distance)
-        else:
-            cv2.imshow("Eye Tracking", frame_top)
-        
-        # Display results for bottom stream
-        if result_bottom is not None:
-            display_results_bottom(frame_bottom, result_bottom, frame_idx, tracker_bottom.thresholds,
-                                  sphere_radius=tracker_bottom.max_observed_distance)
-        else:
-            cv2.imshow("Eye Tracking (Bottom)", frame_bottom)
+        # Display results on full frame
+        display_results(frame, result_top, result_bottom, frame_idx,
+                       sphere_radius_top=tracker_top.max_observed_distance,
+                       sphere_radius_bottom=tracker_bottom.max_observed_distance,
+                       pupil_3d=pupil_3d)
         
         frame_idx += 1
         
