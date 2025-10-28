@@ -384,7 +384,7 @@ class PupilDetector:
 
         return (avg_x, avg_y)
     
-    def display_threshold_grid(self, thresholded_images, contour_images, ellipse_images, best_idx, frame_idx):
+    def display_threshold_grid(self, thresholded_images, contour_images, ellipse_images, best_idx, frame_idx, scores):
         """Display threshold processing grid"""
         N = len(thresholded_images)
         H, W = thresholded_images[0].shape
@@ -402,18 +402,25 @@ class PupilDetector:
         
         grid_disp = cv2.resize(grid, (1400, 400))
         
-        # Label thresholds and highlight selected
+        # Label thresholds, scores, and highlight selected
         col_width = 1400 // N
         for i in range(N):
-            label = f"+{self.thresholds[i]}"
+            threshold_label = f"+{self.thresholds[i]}"
+            score_label = f"{scores[i]:.2f}"
             color = 255 if i == best_idx else 128
-            cv2.putText(grid_disp, label, (i * col_width + 5, 15), 
+            
+            # Draw threshold value at top
+            cv2.putText(grid_disp, threshold_label, (i * col_width + 5, 15), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2 if i == best_idx else 1)
+            
+            # Draw score at bottom
+            cv2.putText(grid_disp, score_label, (i * col_width + 5, 395), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             
             if i == best_idx:
                 x_start = i * col_width
                 x_end = (i + 1) * col_width
-                cv2.rectangle(grid_disp, (x_start, 0), (x_end - 1, 600), 200, 2)
+                cv2.rectangle(grid_disp, (x_start, 0), (x_end - 1, 400), 200, 2)
         
         cv2.imshow(f"Threshold | Contour | Ellipse {self.window_name}", grid_disp)
     
@@ -494,7 +501,7 @@ class PupilDetector:
             self.prev_model_center_avg = model_center_average
         
         # Display threshold grid inside the class
-        self.display_threshold_grid(thresholded_images, contour_images, ellipse_images, best_idx, frame_idx)
+        self.display_threshold_grid(thresholded_images, contour_images, ellipse_images, best_idx, frame_idx, percents)
         
         return {
             'full_ellipse_custom': full_ellipse_custom,
@@ -523,7 +530,131 @@ def draw_orthogonal_ray(image, ellipse, length=100, color=(0, 255, 0), thickness
     cv2.line(image, pt1, pt2, color, thickness)
 
 
-def display_results(frame, result_top, result_bottom, frame_idx, sphere_radius_top=150, sphere_radius_bottom=150, pupil_3d=None):
+def visualize_circle_2d(circle_3d, baseline_mm=36.442):
+    """Visualize 3D circle in X-Z plane (top-down view)"""
+    if circle_3d is None:
+        return None
+    
+    center = circle_3d['center']
+    left_normals = circle_3d.get('left_normals', (None, None))
+    right_normals = circle_3d.get('right_normals', (None, None))
+    
+    # Find which pair of vectors are closest (true gaze direction)
+    left_n1, left_n2 = left_normals
+    right_n1, right_n2 = right_normals
+    
+    # Calculate dot products (closer to 1 = more similar)
+    if left_n1 is not None and right_n1 is not None:
+        dot_11 = np.dot(left_n1, right_n1)
+        dot_12 = np.dot(left_n1, right_n2) if right_n2 is not None else -1
+        dot_21 = np.dot(left_n2, right_n1) if left_n2 is not None else -1
+        dot_22 = np.dot(left_n2, right_n2) if left_n2 is not None and right_n2 is not None else -1
+        
+        # Find maximum dot product (closest pair)
+        max_dot = max(dot_11, dot_12, dot_21, dot_22)
+        
+        # Determine which are the true vectors
+        left_1_is_true = (max_dot == dot_11 or max_dot == dot_12)
+        left_2_is_true = (max_dot == dot_21 or max_dot == dot_22)
+        right_1_is_true = (max_dot == dot_11 or max_dot == dot_21)
+        right_2_is_true = (max_dot == dot_12 or max_dot == dot_22)
+    else:
+        # Default: assume all are non-true
+        left_1_is_true = False
+        left_2_is_true = False
+        right_1_is_true = False
+        right_2_is_true = False
+    
+    # Create a blank canvas (500x500 pixels)
+    canvas_size = 500
+    canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+    
+    # Scale: 1mm = 5 pixels, centered at (250, 450)
+    scale = 5.0
+    origin_x = canvas_size // 2
+    origin_z = canvas_size - 50
+    
+    def world_to_canvas(x, z):
+        """Convert world coordinates (mm) to canvas pixels"""
+        canvas_x = int(origin_x + x * scale)
+        canvas_z = int(origin_z - z * scale)
+        return (canvas_x, canvas_z)
+    
+    # Draw coordinate axes
+    cv2.line(canvas, world_to_canvas(-50, 0), world_to_canvas(50, 0), (100, 100, 100), 1)  # X axis
+    cv2.line(canvas, world_to_canvas(0, 0), world_to_canvas(0, 80), (100, 100, 100), 1)    # Z axis
+    cv2.putText(canvas, "X", world_to_canvas(48, -3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+    cv2.putText(canvas, "Z", world_to_canvas(3, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+    
+    # Draw cameras
+    cam_left_pos = world_to_canvas(-baseline_mm / 2, 0)
+    cam_right_pos = world_to_canvas(baseline_mm / 2, 0)
+    cv2.circle(canvas, cam_left_pos, 5, (255, 255, 255), -1)
+    cv2.circle(canvas, cam_right_pos, 5, (255, 255, 255), -1)
+    cv2.putText(canvas, "L", (cam_left_pos[0] - 15, cam_left_pos[1] + 5), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.putText(canvas, "R", (cam_right_pos[0] + 10, cam_right_pos[1] + 5), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    # Draw pupil center
+    center_pos = world_to_canvas(center[0], center[2])
+    cv2.circle(canvas, center_pos, 4, (0, 0, 255), -1)
+    
+    # Draw viewing rays from cameras to pupil
+    cv2.line(canvas, cam_left_pos, center_pos, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.line(canvas, cam_right_pos, center_pos, (150, 150, 150), 1, cv2.LINE_AA)
+    
+    # Draw normal vector candidates as lines through center
+    vector_length = 15  # mm
+    
+    # Left camera normals (2 candidates)
+    if left_n1 is not None:
+        start_pos = world_to_canvas(center[0] - left_n1[0] * vector_length, 
+                                    center[2] - left_n1[2] * vector_length)
+        end_pos = world_to_canvas(center[0] + left_n1[0] * vector_length, 
+                                 center[2] + left_n1[2] * vector_length)
+        thickness = 2 if left_1_is_true else 1
+        cv2.line(canvas, start_pos, end_pos, (0, 0, 255), thickness)  # BLUE
+    
+    if left_n2 is not None:
+        start_pos = world_to_canvas(center[0] - left_n2[0] * vector_length, 
+                                    center[2] - left_n2[2] * vector_length)
+        end_pos = world_to_canvas(center[0] + left_n2[0] * vector_length, 
+                                 center[2] + left_n2[2] * vector_length)
+        thickness = 2 if left_2_is_true else 1
+        cv2.line(canvas, start_pos, end_pos, (0, 0, 200), thickness)  # LIGHT BLUE
+    
+    # Right camera normals (2 candidates)
+    if right_n1 is not None:
+        start_pos = world_to_canvas(center[0] - right_n1[0] * vector_length, 
+                                    center[2] - right_n1[2] * vector_length)
+        end_pos = world_to_canvas(center[0] + right_n1[0] * vector_length, 
+                                 center[2] + right_n1[2] * vector_length)
+        thickness = 3 if right_1_is_true else 1
+        cv2.line(canvas, start_pos, end_pos, (0, 255, 0), thickness)  # GREEN
+    
+    if right_n2 is not None:
+        start_pos = world_to_canvas(center[0] - right_n2[0] * vector_length, 
+                                    center[2] - right_n2[2] * vector_length)
+        end_pos = world_to_canvas(center[0] + right_n2[0] * vector_length, 
+                                 center[2] + right_n2[2] * vector_length)
+        thickness = 3 if right_2_is_true else 1
+        cv2.line(canvas, start_pos, end_pos, (0, 200, 0), thickness)  # DARK GREEN
+    
+    # Add info text
+    info_text = [
+        f"Position: ({center[0]:.1f}, {center[2]:.1f}) mm",
+        "Left normals: YELLOW/ORANGE",
+        "Right normals: GREEN (bright/dark)"
+    ]
+    for i, text in enumerate(info_text):
+        cv2.putText(canvas, text, (10, 20 + i * 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    return canvas
+
+
+def display_results(frame, result_top, result_bottom, frame_idx, sphere_radius_top=150, sphere_radius_bottom=150, pupil_3d=None, circle_3d=None):
     """Display eye tracking results for both stereo views on the full frame"""
     height = frame.shape[0]
     half_height = height // 2
@@ -639,6 +770,12 @@ def display_results(frame, result_top, result_bottom, frame_idx, sphere_radius_t
         cv2.putText(frame, f"Frame: {frame_idx}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.imshow("Eye Tracking", frame)
+    
+    # Display 3D circle visualization
+    if circle_3d is not None:
+        viz = visualize_circle_2d(circle_3d)
+        if viz is not None:
+            cv2.imshow("3D Pupil Circle (X-Z view)", viz)
 
 
 def select_video_file():
@@ -654,6 +791,208 @@ def select_video_file():
     filename = filedialog.askopenfilename(title="Select Video File", filetypes=filetypes)
     root.destroy()
     return filename
+
+
+def ellipse_to_orthonormal_vectors(ellipse):
+    """
+    Generate two 3D normal vector candidates from an ellipse
+    
+    A circle viewed at an angle appears as an ellipse.
+    The normal to the circle plane can be calculated from the ellipse parameters.
+    
+    Parameters:
+    - ellipse: ((cx, cy), (w, h), angle) - OpenCV ellipse format
+    
+    Returns:
+    - normal_1, normal_2: Two candidate 3D unit normal vectors to the circle plane
+                          (ambiguity in which way the circle is tilted)
+    """
+    if ellipse is None:
+        return None, None
+    
+    (cx, cy), (w, h), angle = ellipse
+    
+    # Get semi-axes
+    semi_major = max(w, h) / 2
+    semi_minor = min(w, h) / 2
+    
+    # Calculate tilt angle from axis ratio
+    # For a circle viewed at angle theta: semi_minor = r * cos(theta)
+    if semi_major > 0:
+        cos_tilt = semi_minor / semi_major
+        cos_tilt = np.clip(cos_tilt, 0, 1)
+        tilt_angle = np.arccos(cos_tilt)
+    else:
+        return None, None
+    
+    # Convert ellipse angle to radians
+    angle_rad = np.deg2rad(angle)
+    
+    # Determine major axis direction in image plane
+    if w >= h:
+        # w is the major axis
+        major_dir_2d = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+    else:
+        # h is the major axis (90 degrees from angle)
+        major_dir_2d = np.array([-np.sin(angle_rad), np.cos(angle_rad)])
+    
+    # The view direction is straight into the image (0, 0, 1) in camera coordinates
+    # Viewing direction: +Z into the image
+    view_direction = np.array([0, 0, 1])
+    
+    # Tilt direction in 3D (perpendicular to view, in direction of major axis)
+    # Map 2D image direction to 3D: X stays X, Y stays Y, Z=0
+    tilt_direction_3d = np.array([major_dir_2d[0], major_dir_2d[1], 0])
+    tilt_direction_3d = tilt_direction_3d / np.linalg.norm(tilt_direction_3d)
+    
+    # Rotate view_direction around tilt_direction by +/- tilt_angle
+    # Using Rodrigues' rotation formula
+    cos_t = np.cos(tilt_angle)
+    sin_t = np.sin(tilt_angle)
+    
+    cross_prod = np.cross(tilt_direction_3d, view_direction)
+    dot_prod = np.dot(tilt_direction_3d, view_direction)
+    
+    # Two candidates
+    normal_1 = view_direction * cos_t + cross_prod * sin_t + tilt_direction_3d * dot_prod * (1 - cos_t)
+    normal_1 = normal_1 / np.linalg.norm(normal_1)
+    
+    normal_2 = view_direction * cos_t - cross_prod * sin_t + tilt_direction_3d * dot_prod * (1 - cos_t)
+    normal_2 = normal_2 / np.linalg.norm(normal_2)
+    
+    return normal_1, normal_2
+
+
+def camera_normal_to_world(normal_camera, pupil_3d, is_left_camera, baseline_mm=36.442):
+    """
+    Transform normal vector from camera coordinates to world coordinates
+    
+    Parameters:
+    - normal_camera: (x, y, z) normal in camera frame where Z points into image
+    - pupil_3d: (x, y, z) 3D position of pupil in world coordinates
+    - is_left_camera: True if left camera, False if right
+    - baseline_mm: distance between cameras
+    
+    Returns:
+    - normal_world: (x, y, z) normal in world coordinates
+    """
+    x_3d, y_3d, z_3d = pupil_3d
+    
+    # Calculate camera position in world coordinates
+    if is_left_camera:
+        camera_x = -baseline_mm / 2
+    else:
+        camera_x = baseline_mm / 2
+    
+    # Vector from camera to pupil in world coordinates
+    dx = x_3d - camera_x
+    dz = z_3d
+    
+    # Calculate actual viewing angle to this pupil position
+    rotation_angle = np.arctan2(dx, dz)
+    
+    # Rotation matrix around Y axis
+    cos_a = np.cos(rotation_angle)
+    sin_a = np.sin(rotation_angle)
+    
+    rotation_matrix = np.array([
+        [cos_a, 0, sin_a],
+        [0, 1, 0],
+        [-sin_a, 0, cos_a]
+    ])
+    
+    # Transform normal from camera to world coordinates
+    normal_world = rotation_matrix @ normal_camera
+    
+    return normal_world
+
+
+def calculate_pupil_radius_mm(ellipse, pupil_3d, is_left_camera, baseline_mm=36.442, 
+                               fov_degrees=120, image_width=648):
+    """
+    Calculate physical pupil radius from ellipse major axis
+    
+    Parameters:
+    - ellipse: ((cx, cy), (w, h), angle) ellipse parameters
+    - pupil_3d: (x, y, z) 3D position of pupil in world coordinates
+    - is_left_camera: True if left camera, False if right
+    - baseline_mm: distance between cameras
+    - fov_degrees: camera field of view
+    - image_width: image width in pixels
+    
+    Returns:
+    - pupil_radius_mm: physical radius in millimeters
+    """
+    x_3d, y_3d, z_3d = pupil_3d
+    
+    # Get major axis length in pixels
+    (cx, cy), (w, h), angle = ellipse
+    major_axis_px = max(w, h) / 2  # radius in pixels
+    
+    # Calculate camera position
+    if is_left_camera:
+        camera_x = -baseline_mm / 2
+    else:
+        camera_x = baseline_mm / 2
+    
+    # Distance from camera to pupil
+    dx = x_3d - camera_x
+    dy = y_3d
+    dz = z_3d
+    distance_to_pupil = np.sqrt(dx**2 + dy**2 + dz**2)
+    
+    # Calculate pixels per mm at this distance
+    fov_rad = np.deg2rad(fov_degrees)
+    sensor_width_mm = 2 * distance_to_pupil * np.tan(fov_rad / 2)
+    pixels_per_mm = image_width / sensor_width_mm
+    
+    # Convert major axis from pixels to mm
+    pupil_radius_mm = major_axis_px / pixels_per_mm
+    
+    return pupil_radius_mm
+
+
+def reconstruct_3d_circle(ellipse_left, ellipse_right, pupil_3d, 
+                          baseline_mm=36.442, fov_degrees=120, 
+                          convergence_angle_degrees=36, image_width=648, image_height=486):
+    """
+    Reconstruct 3D circle (pupil) from two 2D ellipses using orthonormal vectors
+    """
+    if ellipse_left is None or ellipse_right is None or pupil_3d is None:
+        return None
+    
+    x_3d, y_3d, z_3d = pupil_3d
+    
+    # Get normal vectors in camera coordinates
+    left_n1_cam, left_n2_cam = ellipse_to_orthonormal_vectors(ellipse_left)
+    right_n1_cam, right_n2_cam = ellipse_to_orthonormal_vectors(ellipse_right)
+    
+    if left_n1_cam is None or right_n1_cam is None:
+        return None
+    
+    # Transform to world coordinates using actual 3D pupil position
+    left_n1_world = camera_normal_to_world(left_n1_cam, pupil_3d, is_left_camera=True, baseline_mm=baseline_mm)
+    left_n2_world = camera_normal_to_world(left_n2_cam, pupil_3d, is_left_camera=True, baseline_mm=baseline_mm)
+    right_n1_world = camera_normal_to_world(right_n1_cam, pupil_3d, is_left_camera=False, baseline_mm=baseline_mm)
+    right_n2_world = camera_normal_to_world(right_n2_cam, pupil_3d, is_left_camera=False, baseline_mm=baseline_mm)
+    
+    # Calculate pupil radius from both cameras and average
+    radius_left = calculate_pupil_radius_mm(ellipse_left, pupil_3d, is_left_camera=True, 
+                                           baseline_mm=baseline_mm, fov_degrees=fov_degrees, 
+                                           image_width=image_width)
+    radius_right = calculate_pupil_radius_mm(ellipse_right, pupil_3d, is_left_camera=False,
+                                            baseline_mm=baseline_mm, fov_degrees=fov_degrees,
+                                            image_width=image_width)
+    pupil_radius_mm = (radius_left + radius_right) / 2
+    
+    return {
+        'center': np.array([x_3d, y_3d, z_3d]),
+        'left_normals': (left_n1_world, left_n2_world),
+        'right_normals': (right_n1_world, right_n2_world),
+        'radius_mm': pupil_radius_mm,
+        'radius_left_mm': radius_left,
+        'radius_right_mm': radius_right,
+    }
 
 
 def triangulate_converging_cameras(pupil_left, pupil_right, baseline_mm=36.442, 
@@ -801,6 +1140,7 @@ def main():
         
         # Triangulate 3D pupil position
         pupil_3d = None
+        circle_3d = None
         if result_top is not None and result_bottom is not None:
             # Assign left/right based on configuration
             if TOP_IS_LEFT:
@@ -809,7 +1149,6 @@ def main():
             else:
                 pupil_left = (result_bottom['cx'], result_bottom['cy'])
                 pupil_right = (result_top['cx'], result_top['cy'])
-            print(f"Pupil left: {pupil_left[0]:.2f} - Pupil right: {pupil_right[0]:.2f} - {pupil_right[0] - pupil_left[0]:.2f}")
             
             # Triangulate 3D position
             pupil_3d = triangulate_converging_cameras(
@@ -827,6 +1166,36 @@ def main():
                 # Only use valid depth (positive Z, reasonable range)
                 if z_mm > 5.0 and z_mm < 100.0:
                     
+                    # Reconstruct 3D pupil circle from ellipses
+                    # Get ellipse data from results
+                    if TOP_IS_LEFT:
+                        ellipse_left_data = result_top['best_ellipse_opencv']
+                        ellipse_right_data = result_bottom['best_ellipse_opencv']
+                    else:
+                        ellipse_left_data = result_bottom['best_ellipse_opencv']
+                        ellipse_right_data = result_top['best_ellipse_opencv']
+                    
+                    if ellipse_left_data is not None and ellipse_right_data is not None:
+                        # Extract ellipse parameters (without crop offsets for now)
+                        ellipse_left, _, _ = ellipse_left_data
+                        ellipse_right, _, _ = ellipse_right_data
+                        
+                        # Reconstruct 3D circle
+                        circle_3d = reconstruct_3d_circle(
+                            ellipse_left, ellipse_right, pupil_3d,
+                            baseline_mm=BASELINE_MM,
+                            fov_degrees=FOV_DEGREES,
+                            convergence_angle_degrees=CONVERGENCE_ANGLE,
+                            image_width=IMAGE_WIDTH,
+                            image_height=frame_top.shape[0]
+                        )
+                        
+                        if circle_3d is not None:
+                            pupil_radius_mm = circle_3d['radius_mm']
+                            radius_left_mm = circle_3d['radius_left_mm']
+                            radius_right_mm = circle_3d['radius_right_mm']
+                            print(f"  Pupil radius: Left={radius_left_mm:.2f}mm, Right={radius_right_mm:.2f}mm, Avg={pupil_radius_mm:.2f}mm, Diff={radius_right_mm - radius_left_mm:.2f}mm")
+                        
                     # Calculate sphere radius in pixels for each camera view
                     # The sphere center is at the eyeball center, pupil is on the surface
                     # We need to calculate the 2D pixel distance from sphere center to pupil
@@ -890,7 +1259,8 @@ def main():
         display_results(frame, result_top, result_bottom, frame_idx,
                        sphere_radius_top=tracker_top.max_observed_distance,
                        sphere_radius_bottom=tracker_bottom.max_observed_distance,
-                       pupil_3d=pupil_3d)
+                       pupil_3d=pupil_3d,
+                       circle_3d=circle_3d)
         
         frame_idx += 1
         
